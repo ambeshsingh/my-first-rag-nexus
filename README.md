@@ -132,3 +132,4 @@ python src/document_retriever/rag_retriever.py "What are the cloud architecture 
 - **No Prompt-Based Security**: RBAC is enforced strictly at the database level (`where={"persona": {"$in": ...}}`), preventing prompt-injection attacks.
 - **Zero Local Vector DB Commits**: `chroma_db/` and credential files are gitignored.
 - **Deterministic Citations**: Answers strictly reference source documents and page numbers.
+
