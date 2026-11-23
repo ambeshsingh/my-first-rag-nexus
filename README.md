@@ -18,11 +18,12 @@ flowchart TD
         Embed --> Chroma[("ChromaDB (./chroma_db)")]
     end
 
-    subgraph Retrieval["2. Secure Retrieval & Generation"]
-        User["User Question + Persona"] --> PreFilter["Pre-Retrieval Metadata Filter<br/>(Chroma $in operator)"]
-        Chroma -.->|"Only scans authorized chunks"| PreFilter
-        PreFilter --> MMR["Maximal Marginal Relevance (MMR)"]
-        MMR --> Context["Formatted Excerpts with Page Citations"]
+    subgraph Retrieval["2. Hybrid Retrieval & Generation"]
+        User["User Question + Persona"] --> PreFilter["Persona RBAC Filter<br/>(Allowed Categories)"]
+        PreFilter --> Dense["Dense Leg: Chroma MMR (60%)"]
+        PreFilter --> Sparse["Sparse Leg: BM25 Lexical (40%)"]
+        Dense & Sparse --> RRF["Reciprocal Rank Fusion (RRF)"]
+        RRF --> Context["Formatted Excerpts with Citations"]
         Context --> LLM["Google Gemini (gemini-3.5-flash)"]
         LLM --> Output["Grounded Answer with Page Footnotes"]
     end
@@ -107,24 +108,24 @@ Download PDFs from GCS, attach persona metadata, chunk, and persist to `./chroma
 python src/document_embedder/chroma_store.py --reindex
 ```
 
-### 2. Query with Persona Filtering
+### 2. Query with Hybrid Search & Persona Filtering
 
-#### Query as a Standard Employee:
+#### Query Technical Specs / Project Codename (Hybrid Search):
 ```bash
-python src/document_retriever/rag_retriever.py "how much is performance bonus?" --persona employee
+python src/document_retriever/rag_retriever.py "What are the objectives of Project Aegis?" --persona engineering --mode hybrid
 ```
-*Output: The retriever filters out executive compensation documents. The LLM responds that it does not have enough information.*
+
+#### Query as a Standard Employee (Dense + BM25 RBAC enforced):
+```bash
+python src/document_retriever/rag_retriever.py "how much is performance bonus?" --persona employee --mode hybrid
+```
+*Output: Both BM25 and Chroma filter out executive compensation documents. The LLM responds that it does not have enough information.*
 
 #### Query as an Executive:
 ```bash
-python src/document_retriever/rag_retriever.py "how much is performance bonus?" --persona executive
+python src/document_retriever/rag_retriever.py "how much is performance bonus?" --persona executive --mode hybrid
 ```
 *Output: Retrieves the confidential compensation table and generates the exact figures with citations.*
-
-#### Query Technical Specs as an Engineer:
-```bash
-python src/document_retriever/rag_retriever.py "What are the cloud architecture standards?" --persona engineering
-```
 
 ---
 
