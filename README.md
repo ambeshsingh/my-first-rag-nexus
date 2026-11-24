@@ -18,12 +18,21 @@ flowchart TD
         Embed --> Chroma[("ChromaDB (./chroma_db)")]
     end
 
-    subgraph Retrieval["2. Hybrid Retrieval & Generation"]
+    subgraph Retrieval["2. Two-Stage Retrieve & Rerank"]
         User["User Question + Persona"] --> PreFilter["Persona RBAC Filter<br/>(Allowed Categories)"]
-        PreFilter --> Dense["Dense Leg: Chroma MMR (60%)"]
-        PreFilter --> Sparse["Sparse Leg: BM25 Lexical (40%)"]
-        Dense & Sparse --> RRF["Reciprocal Rank Fusion (RRF)"]
-        RRF --> Context["Formatted Excerpts with Citations"]
+        
+        subgraph Stage1["Stage 1: High-Recall Hybrid Retrieval (k=15)"]
+            PreFilter --> Dense["Dense Leg: Chroma MMR (60%)"]
+            PreFilter --> Sparse["Sparse Leg: BM25 Lexical (40%)"]
+            Dense & Sparse --> RRF["Reciprocal Rank Fusion (RRF)"]
+        end
+
+        subgraph Stage2["Stage 2: High-Precision Cross-Encoder (FlashRank)"]
+            RRF --> CrossEncoder["FlashRank ms-marco-TinyBERT<br/>(Full Query-Doc Cross-Attention)"]
+            CrossEncoder --> RerankTop["Top K=5 Rescored Chunks"]
+        end
+
+        RerankTop --> Context["Formatted Excerpts with Citations & Scores"]
         Context --> LLM["Google Gemini (gemini-3.5-flash)"]
         LLM --> Output["Grounded Answer with Page Footnotes"]
     end
@@ -108,24 +117,25 @@ Download PDFs from GCS, attach persona metadata, chunk, and persist to `./chroma
 python src/document_embedder/chroma_store.py --reindex
 ```
 
-### 2. Query with Hybrid Search & Persona Filtering
+### 2. Query with Two-Stage Cross-Encoder Reranking
 
-#### Query Technical Specs / Project Codename (Hybrid Search):
+#### Query Technical Specs / Project Codename (Retrieve & Rerank):
 ```bash
-python src/document_retriever/rag_retriever.py "What are the objectives of Project Aegis?" --persona engineering --mode hybrid
+python src/document_retriever/rag_retriever.py "What are the objectives of Project Aegis?" --persona engineering --mode rerank
 ```
+*Stage 1 fetches top-15 candidates via Hybrid RRF, and Stage 2 reranks them using FlashRank ONNX cross-attention to pass the top-5 cleanest chunks to Gemini.*
 
-#### Query as a Standard Employee (Dense + BM25 RBAC enforced):
+#### Query as a Standard Employee (Strict RBAC Enforced):
 ```bash
-python src/document_retriever/rag_retriever.py "how much is performance bonus?" --persona employee --mode hybrid
+python src/document_retriever/rag_retriever.py "how much is performance bonus?" --persona employee --mode rerank
 ```
-*Output: Both BM25 and Chroma filter out executive compensation documents. The LLM responds that it does not have enough information.*
+*Output: Pre-retrieval filters block confidential executive documents. FlashRank scores non-confidential docs near 0.0, and the LLM responds that it does not have enough information.*
 
 #### Query as an Executive:
 ```bash
-python src/document_retriever/rag_retriever.py "how much is performance bonus?" --persona executive --mode hybrid
+python src/document_retriever/rag_retriever.py "how much is performance bonus?" --persona executive --mode rerank
 ```
-*Output: Retrieves the confidential compensation table and generates the exact figures with citations.*
+*Output: Retrieves confidential compensation tables, reranks highest-relevance excerpts to Rank #1, and generates exact figures with citations.*
 
 ---
 

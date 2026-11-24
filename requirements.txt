@@ -20,6 +20,7 @@ docstring_parser==0.18.0
 durationpy==0.11
 filelock==4.2.10
 filetype==1.2.0
+FlashRank==0.2.10
 flatbuffers==25.12.19
 frozenlist==1.8.0
 fsspec==2026.9.0

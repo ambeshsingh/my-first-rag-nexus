@@ -14,6 +14,16 @@ from langchain_chroma import Chroma
 from langchain_community.retrievers import BM25Retriever
 
 # ==============================================================================
+# BLOCK: FlashRank Cross-Encoder Import
+# Purpose: Imports FlashRank Ranker and RerankRequest for high-precision,
+#          low-latency CPU cross-encoder reranking (Stage 2 retrieval).
+# ==============================================================================
+try:
+    from flashrank import Ranker, RerankRequest
+except ImportError:
+    Ranker, RerankRequest = None, None
+
+# ==============================================================================
 # BLOCK: Dynamic EnsembleRetriever Import
 # Purpose: Import EnsembleRetriever with fallback support across different
 #          LangChain module structures (langchain vs langchain_classic).
@@ -249,13 +259,102 @@ def get_hybrid_retriever(
 
 
 # ==============================================================================
+# BLOCK: FlashRank Cross-Encoder Model Singleton
+# Purpose: Lazily initializes and caches the FlashRank model instance in memory
+#          to prevent redundant disk I/O and ONNX session initialization on every query.
+# ==============================================================================
+_FLASHRANK_RANKER: Optional[object] = None
+
+
+def get_cross_encoder_ranker(model_name: str = "ms-marco-TinyBERT-L-2-v2") -> Optional[object]:
+    """
+    Returns the cached FlashRank Ranker singleton.
+    Uses 'ms-marco-TinyBERT-L-2-v2' (default) for ultra-fast, high-precision ONNX CPU inference.
+    """
+    global _FLASHRANK_RANKER
+    if Ranker is None:
+        return None
+    if _FLASHRANK_RANKER is None:
+        _FLASHRANK_RANKER = Ranker(model_name=model_name)
+    return _FLASHRANK_RANKER
+
+
+# ==============================================================================
+# BLOCK: Cross-Encoder Document Reranker (Stage 2)
+# Purpose: Takes high-recall candidates from Stage 1 (Hybrid Search) and re-evaluates
+#          every (query, document) pair with full cross-attention to score true relevance.
+# ==============================================================================
+def rerank_documents(
+    query: str,
+    documents: List[Document],
+    top_k: int = 5,
+    model_name: str = "ms-marco-TinyBERT-L-2-v2",
+) -> List[Document]:
+    """
+    Re-scores and re-ranks retrieved chunks using the FlashRank Cross-Encoder.
+
+    Parameters:
+    - query: The original user question.
+    - documents: The candidate chunks retrieved from Stage 1 (e.g. 15-20 candidates).
+    - top_k: Number of highest-relevance chunks to return for LLM synthesis (default 5).
+
+    How it works:
+    1. Packages query + chunk texts into FlashRank RerankRequest passages.
+    2. Executes ONNX cross-attention scoring between query tokens and document tokens.
+    3. Attaches 'rerank_score' and 'stage1_rank' to each document's metadata.
+    4. Truncates and returns the top_k most relevant chunks.
+    """
+    if not documents:
+        return []
+
+    ranker = get_cross_encoder_ranker(model_name=model_name)
+    if ranker is None:
+        return documents[:top_k]
+
+    # Convert LangChain Documents to FlashRank passage dicts
+    passages = [
+        {
+            "id": idx,
+            "text": doc.page_content,
+            "meta": doc.metadata,
+        }
+        for idx, doc in enumerate(documents)
+    ]
+
+    request = RerankRequest(query=query, passages=passages)
+    reranked_results = ranker.rerank(request)
+
+    # Reconstruct top_k Document objects with rerank scores and rank tracking
+    reranked_docs = []
+    for new_rank, item in enumerate(reranked_results[:top_k], start=1):
+        original_idx = item["id"]
+        original_doc = documents[original_idx]
+
+        # Preserve all original metadata and record rerank insights
+        new_metadata = dict(original_doc.metadata)
+        new_metadata["rerank_score"] = float(item["score"])
+        new_metadata["stage1_rank"] = original_idx + 1  # 1-based index in Stage 1
+        new_metadata["stage2_rank"] = new_rank
+
+        reranked_docs.append(
+            Document(
+                page_content=original_doc.page_content,
+                metadata=new_metadata,
+            )
+        )
+
+    return reranked_docs
+
+
+# ==============================================================================
 # BLOCK: Document Context Formatter with Citations
 # Purpose: Formats retrieved chunks into clean markdown blocks labeled with
-#          source filename, page number, and persona access level.
+#          source filename, page number, persona access level, and rerank score.
 # ==============================================================================
 def format_documents_with_citations(docs: List[Document]) -> str:
     """
     Formats retrieved document chunks into clean, cited context blocks for the LLM.
+    Includes the cross-encoder score if available.
     """
     if not docs:
         return "No relevant context found in documents."
@@ -265,7 +364,10 @@ def format_documents_with_citations(docs: List[Document]) -> str:
         source = Path(doc.metadata.get("source", "Unknown")).name
         page = doc.metadata.get("page", "N/A")
         role = doc.metadata.get("persona", "all").upper()
-        header = f"[Excerpt #{idx} | Role: {role} | Source: {source} | Page: {page}]"
+        score_info = ""
+        if "rerank_score" in doc.metadata:
+            score_info = f" | Score: {doc.metadata['rerank_score']:.4f}"
+        header = f"[Excerpt #{idx} | Role: {role} | Source: {source} | Page: {page}{score_info}]"
         content = doc.page_content.strip()
         formatted_blocks.append(f"{header}\n{content}")
 
@@ -309,51 +411,86 @@ def build_rag_chain(llm: Optional[BaseChatModel] = None):
 # ==============================================================================
 # BLOCK: Query Execution and Response Pipeline
 # Purpose: Handles the complete end-to-end question answering pipeline:
-#          retrieval (Hybrid or MMR) -> citation printing -> LLM synthesis.
+#          - 'rerank': Two-stage Hybrid broad fetch (k=15) -> Cross-Encoder top-5.
+#          - 'hybrid': Reciprocal Rank Fusion of Chroma MMR + BM25.
+#          - 'mmr': Pure Dense Vector MMR search.
 # ==============================================================================
 def ask_question(
     vector_store: Chroma,
     question: str,
     persona: str = "employee",
-    search_mode: str = "hybrid",
+    search_mode: str = "rerank",
     k: int = 5,
+    initial_k: int = 15,
 ) -> str:
     """
     Executes a query through the RAG pipeline:
+    - search_mode='rerank' (Default): Two-Stage Retrieve & Rerank.
+        Stage 1: Broad Hybrid Search (k=15) using Chroma MMR + BM25 + RRF with RBAC.
+        Stage 2: High-Precision Cross-Encoder (FlashRank) reranking down to top k=5.
     - search_mode='hybrid': Fuses Dense MMR and Sparse BM25 via Reciprocal Rank Fusion.
-    - search_mode='mmr': Uses pure Dense Vector MMR search.
+    - search_mode='mmr': Pure Dense Vector MMR search.
     """
-    # Select retriever based on search_mode
-    if search_mode == "hybrid":
-        retriever = get_hybrid_retriever(vector_store, persona=persona, k=k)
-    else:
-        retriever = get_advanced_retriever(vector_store, persona=persona, search_type="mmr", k=k)
-
-    chain = build_rag_chain()
-
-    # --- SINGLE RETRIEVAL CALL WITH PRE-FILTERING ---
-    retrieved_docs = retriever.invoke(question)
-
-    print("\n" + "=" * 65)
+    print("\n" + "=" * 70)
     print(f"USER PERSONA : {persona.upper()}")
     print(f"SEARCH MODE  : {search_mode.upper()}")
     print(f"QUESTION     : {question}")
-    print("=" * 65)
-    print(f"Retrieved {len(retrieved_docs)} authorized chunk(s):")
-    for idx, doc in enumerate(retrieved_docs, start=1):
-        source = Path(doc.metadata.get("source", "Unknown")).name
-        page = doc.metadata.get("page", "N/A")
-        role_tag = doc.metadata.get("persona", "all").upper()
-        print(f"  {idx}. [{role_tag:11}] {source} (Page {page}) - {len(doc.page_content)} chars")
+    print("=" * 70)
+
+    if search_mode == "rerank":
+        # STAGE 1: High-Recall Hybrid Retrieval (broad candidate pool)
+        hybrid_retriever = get_hybrid_retriever(vector_store, persona=persona, k=initial_k)
+        initial_candidates = hybrid_retriever.invoke(question)
+
+        print(f"\n[Stage 1: Hybrid Retrieval] Fetched {len(initial_candidates)} candidate chunk(s):")
+        for idx, doc in enumerate(initial_candidates, start=1):
+            source = Path(doc.metadata.get("source", "Unknown")).name
+            page = doc.metadata.get("page", "N/A")
+            role_tag = doc.metadata.get("persona", "all").upper()
+            print(f"  Stage-1 #{idx:2d} | [{role_tag:11}] {source} (Page {page})")
+
+        # STAGE 2: High-Precision Cross-Encoder Reranking
+        print(f"\n[Stage 2: Cross-Encoder Rerank] Scoring candidates with FlashRank...")
+        retrieved_docs = rerank_documents(query=question, documents=initial_candidates, top_k=k)
+
+        print(f"Selected Top-{len(retrieved_docs)} Reranked chunk(s) for context:")
+        for idx, doc in enumerate(retrieved_docs, start=1):
+            source = Path(doc.metadata.get("source", "Unknown")).name
+            page = doc.metadata.get("page", "N/A")
+            role_tag = doc.metadata.get("persona", "all").upper()
+            score = doc.metadata.get("rerank_score", 0.0)
+            orig_rank = doc.metadata.get("stage1_rank", "N/A")
+            print(f"  Rank #{idx} (was #{orig_rank:2d} in Stg 1) | Score: {score:.5f} | [{role_tag:11}] {source} (p. {page})")
+
+    elif search_mode == "hybrid":
+        retriever = get_hybrid_retriever(vector_store, persona=persona, k=k)
+        retrieved_docs = retriever.invoke(question)
+        print(f"\nRetrieved {len(retrieved_docs)} authorized chunk(s) via Hybrid RRF:")
+        for idx, doc in enumerate(retrieved_docs, start=1):
+            source = Path(doc.metadata.get("source", "Unknown")).name
+            page = doc.metadata.get("page", "N/A")
+            role_tag = doc.metadata.get("persona", "all").upper()
+            print(f"  {idx}. [{role_tag:11}] {source} (Page {page}) - {len(doc.page_content)} chars")
+
+    else:
+        retriever = get_advanced_retriever(vector_store, persona=persona, search_type="mmr", k=k)
+        retrieved_docs = retriever.invoke(question)
+        print(f"\nRetrieved {len(retrieved_docs)} authorized chunk(s) via Dense MMR:")
+        for idx, doc in enumerate(retrieved_docs, start=1):
+            source = Path(doc.metadata.get("source", "Unknown")).name
+            page = doc.metadata.get("page", "N/A")
+            role_tag = doc.metadata.get("persona", "all").upper()
+            print(f"  {idx}. [{role_tag:11}] {source} (Page {page}) - {len(doc.page_content)} chars")
 
     # Format the retrieved docs as context
     context_text = format_documents_with_citations(retrieved_docs)
 
+    chain = build_rag_chain()
     print("\nGenerating grounded response with citations...")
     answer = chain.invoke({"context": context_text, "question": question})
 
     print(f"\nANSWER:\n{answer}")
-    print("=" * 65 + "\n")
+    print("=" * 70 + "\n")
     return answer
 
 
@@ -361,15 +498,15 @@ def ask_question(
 # BLOCK: CLI Entrypoint
 # Purpose: Allows testing queries directly from the terminal with custom persona
 #          and search mode flags.
-#          Usage: python src/document_retriever/rag_retriever.py "query" --persona engineering --mode hybrid
+#          Usage: python src/document_retriever/rag_retriever.py "query" --persona engineering --mode rerank
 # ==============================================================================
 if __name__ == "__main__":
     # 1. Load the persistent Chroma vector store
     store = get_or_create_vector_store()
 
-    # 2. Parse command-line arguments: question, --persona <role>, and --mode <hybrid|mmr>
+    # 2. Parse command-line arguments: question, --persona <role>, and --mode <rerank|hybrid|mmr>
     persona_arg = "employee"
-    mode_arg = "hybrid"
+    mode_arg = "rerank"
     args = sys.argv[1:]
 
     # Parse persona flag
