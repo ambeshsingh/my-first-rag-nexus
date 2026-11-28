@@ -117,7 +117,19 @@ Download PDFs from GCS, attach persona metadata, chunk, and persist to `./chroma
 python src/document_embedder/chroma_store.py --reindex
 ```
 
-### 2. Query with Two-Stage Cross-Encoder Reranking
+### 2. Launch the Interactive Streamlit Web UI
+
+Start the multi-turn conversational chat interface with live persona switching and retrieval diagnostics:
+```bash
+streamlit run app.py
+```
+- **Persona Switcher:** Switch between `Employee`, `Engineering`, `HR`, `Sales`, `Security`, `Finance`, and `Executive` in the sidebar.
+- **Conversational Memory:** Resolves conversational follow-ups (e.g., *"Who leads that?"* $\to$ *"Who leads Project Aegis?"*).
+- **Retrieval & Rerank Inspector:** Click the expandable drawer beneath each response to view the reformulated search query, Stage 1 candidate ranks, and Stage 2 FlashRank cross-encoder scores.
+
+---
+
+### 3. CLI Querying with Two-Stage Cross-Encoder Reranking
 
 #### Query Technical Specs / Project Codename (Retrieve & Rerank):
 ```bash

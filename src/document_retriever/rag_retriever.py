@@ -409,11 +409,147 @@ def build_rag_chain(llm: Optional[BaseChatModel] = None):
 
 
 # ==============================================================================
-# BLOCK: Query Execution and Response Pipeline
-# Purpose: Handles the complete end-to-end question answering pipeline:
-#          - 'rerank': Two-stage Hybrid broad fetch (k=15) -> Cross-Encoder top-5.
-#          - 'hybrid': Reciprocal Rank Fusion of Chroma MMR + BM25.
-#          - 'mmr': Pure Dense Vector MMR search.
+# BLOCK: Contextual Query Reformulation (Multi-Turn Conversational Memory)
+# Purpose: Uses chat history to resolve pronouns ("it", "that project", "those terms")
+#          into a standalone search query optimized for vector and keyword retrieval.
+# ==============================================================================
+def reformulate_query(
+    question: str,
+    chat_history: Optional[List[dict]] = None,
+    llm: Optional[BaseChatModel] = None,
+) -> str:
+    """
+    Rewrites a conversational follow-up question into an independent, standalone
+    search query using prior turns from chat_history.
+
+    If chat_history is empty or None, returns the original question unchanged.
+    """
+    if not chat_history:
+        return question
+
+    llm = llm or get_llm()
+
+    # Format the recent history turns (last 6 messages max)
+    history_lines = []
+    for msg in chat_history[-6:]:
+        role = "User" if msg.get("role") == "user" else "Assistant"
+        content = msg.get("content", "").strip()
+        # Avoid including diagnostic blocks in history
+        if "🔍 Retrieval & Rerank Diagnostics" in content:
+            content = content.split("🔍 Retrieval & Rerank Diagnostics")[0].strip()
+        if content:
+            history_lines.append(f"{role}: {content}")
+
+    if not history_lines:
+        return question
+
+    history_str = "\n".join(history_lines)
+
+    prompt = (
+        "Given the conversation history and a follow-up question below, "
+        "rephrase the follow-up question to be a standalone, self-contained search query.\n\n"
+        "Guidelines:\n"
+        "1. Resolve all pronouns (e.g., 'it', 'its', 'they', 'that policy', 'this project') to the exact entity mentioned in history.\n"
+        "2. Keep company names, project names, document types, or technical terms intact.\n"
+        "3. Do NOT answer the question. Only output the rewritten search query.\n"
+        "4. If the question is already fully self-contained, return it verbatim.\n\n"
+        f"Conversation History:\n{history_str}\n\n"
+        f"Follow-up Question: {question}\n\n"
+        "Standalone Search Query:"
+    )
+
+    response = llm.invoke(prompt)
+    standalone = response.content if hasattr(response, "content") else str(response)
+
+    # Safely handle list of parts from multimodal or Vertex chat output formats
+    if isinstance(standalone, list):
+        text_parts = []
+        for part in standalone:
+            if isinstance(part, str):
+                text_parts.append(part)
+            elif isinstance(part, dict) and "text" in part:
+                text_parts.append(part["text"])
+            elif hasattr(part, "text"):
+                text_parts.append(str(part.text))
+            else:
+                text_parts.append(str(part))
+        standalone = " ".join(text_parts)
+    elif not isinstance(standalone, str):
+        standalone = str(standalone)
+
+    cleaned = standalone.strip().strip('"').strip("'")
+    return cleaned or question
+
+
+# ==============================================================================
+# BLOCK: Multi-Turn Conversational Query Pipeline with Diagnostics
+# Purpose: Orchestrates multi-turn conversational query execution, running:
+#          1. Contextual Query Reformulation (Chat Memory)
+#          2. Two-Stage Retrieve & Rerank (RBAC Pre-filtering + FlashRank)
+#          3. Grounded Answer Synthesis
+#          Returns both the synthesized answer and rich diagnostic metadata for UI inspection.
+# ==============================================================================
+def ask_question_conversational(
+    vector_store: Chroma,
+    question: str,
+    chat_history: Optional[List[dict]] = None,
+    persona: str = "employee",
+    search_mode: str = "rerank",
+    k: int = 5,
+    initial_k: int = 15,
+) -> dict:
+    """
+    Executes a conversational query:
+    1. Reformulates ambiguous follow-up questions using chat_history.
+    2. Runs Stage 1 (Hybrid or MMR) with Pre-Retrieval RBAC metadata filtering.
+    3. Runs Stage 2 (FlashRank Cross-Encoder reranking) if search_mode=='rerank'.
+    4. Formats context excerpts and calls Gemini with strict grounding.
+    5. Returns dictionary with answer, standalone_query, retrieved_docs, initial_candidates.
+    """
+    # 1. Reformulate question if prior conversation turns exist
+    standalone_query = reformulate_query(question=question, chat_history=chat_history)
+
+    # 2. Execute retrieval based on search_mode using standalone_query
+    initial_candidates = []
+    if search_mode == "rerank":
+        # STAGE 1: Broad Hybrid Search (k=initial_k)
+        hybrid_retriever = get_hybrid_retriever(vector_store, persona=persona, k=initial_k)
+        initial_candidates = hybrid_retriever.invoke(standalone_query)
+
+        # STAGE 2: FlashRank Cross-Encoder Reranker
+        retrieved_docs = rerank_documents(
+            query=standalone_query,
+            documents=initial_candidates,
+            top_k=k,
+        )
+    elif search_mode == "hybrid":
+        retriever = get_hybrid_retriever(vector_store, persona=persona, k=k)
+        retrieved_docs = retriever.invoke(standalone_query)
+        initial_candidates = retrieved_docs
+    else:
+        retriever = get_advanced_retriever(vector_store, persona=persona, search_type="mmr", k=k)
+        retrieved_docs = retriever.invoke(standalone_query)
+        initial_candidates = retrieved_docs
+
+    # 3. Format context with citations and generate answer
+    context_text = format_documents_with_citations(retrieved_docs)
+    chain = build_rag_chain()
+    answer = chain.invoke({"context": context_text, "question": question})
+
+    return {
+        "answer": answer,
+        "standalone_query": standalone_query,
+        "retrieved_docs": retrieved_docs,
+        "initial_candidates": initial_candidates,
+        "persona": persona,
+        "search_mode": search_mode,
+    }
+
+
+# ==============================================================================
+# BLOCK: Query Execution and Response Pipeline (CLI Wrapper)
+# Purpose: Handles CLI terminal execution while delegating core logic to the
+#          conversational engine. Prints formatted diagnostics to stdout.
 # ==============================================================================
 def ask_question(
     vector_store: Chroma,
@@ -424,11 +560,9 @@ def ask_question(
     initial_k: int = 15,
 ) -> str:
     """
-    Executes a query through the RAG pipeline:
+    Executes a query through the RAG pipeline for CLI usage:
     - search_mode='rerank' (Default): Two-Stage Retrieve & Rerank.
-        Stage 1: Broad Hybrid Search (k=15) using Chroma MMR + BM25 + RRF with RBAC.
-        Stage 2: High-Precision Cross-Encoder (FlashRank) reranking down to top k=5.
-    - search_mode='hybrid': Fuses Dense MMR and Sparse BM25 via Reciprocal Rank Fusion.
+    - search_mode='hybrid': Dense MMR + Sparse BM25 via Reciprocal Rank Fusion.
     - search_mode='mmr': Pure Dense Vector MMR search.
     """
     print("\n" + "=" * 70)
@@ -437,61 +571,47 @@ def ask_question(
     print(f"QUESTION     : {question}")
     print("=" * 70)
 
-    if search_mode == "rerank":
-        # STAGE 1: High-Recall Hybrid Retrieval (broad candidate pool)
-        hybrid_retriever = get_hybrid_retriever(vector_store, persona=persona, k=initial_k)
-        initial_candidates = hybrid_retriever.invoke(question)
+    result = ask_question_conversational(
+        vector_store=vector_store,
+        question=question,
+        chat_history=None,
+        persona=persona,
+        search_mode=search_mode,
+        k=k,
+        initial_k=initial_k,
+    )
 
-        print(f"\n[Stage 1: Hybrid Retrieval] Fetched {len(initial_candidates)} candidate chunk(s):")
-        for idx, doc in enumerate(initial_candidates, start=1):
+    if result["standalone_query"] != question:
+        print(f"\n[Multi-Turn Contextualizer] Reformulated Query: '{result['standalone_query']}'")
+
+    if search_mode == "rerank":
+        print(f"\n[Stage 1: Hybrid Retrieval] Fetched {len(result['initial_candidates'])} candidate chunk(s):")
+        for idx, doc in enumerate(result["initial_candidates"], start=1):
             source = Path(doc.metadata.get("source", "Unknown")).name
             page = doc.metadata.get("page", "N/A")
             role_tag = doc.metadata.get("persona", "all").upper()
             print(f"  Stage-1 #{idx:2d} | [{role_tag:11}] {source} (Page {page})")
 
-        # STAGE 2: High-Precision Cross-Encoder Reranking
-        print(f"\n[Stage 2: Cross-Encoder Rerank] Scoring candidates with FlashRank...")
-        retrieved_docs = rerank_documents(query=question, documents=initial_candidates, top_k=k)
-
-        print(f"Selected Top-{len(retrieved_docs)} Reranked chunk(s) for context:")
-        for idx, doc in enumerate(retrieved_docs, start=1):
+        print(f"\n[Stage 2: Cross-Encoder Rerank] Selected Top-{len(result['retrieved_docs'])} Reranked chunk(s):")
+        for idx, doc in enumerate(result["retrieved_docs"], start=1):
             source = Path(doc.metadata.get("source", "Unknown")).name
             page = doc.metadata.get("page", "N/A")
             role_tag = doc.metadata.get("persona", "all").upper()
             score = doc.metadata.get("rerank_score", 0.0)
             orig_rank = doc.metadata.get("stage1_rank", "N/A")
             print(f"  Rank #{idx} (was #{orig_rank:2d} in Stg 1) | Score: {score:.5f} | [{role_tag:11}] {source} (p. {page})")
-
-    elif search_mode == "hybrid":
-        retriever = get_hybrid_retriever(vector_store, persona=persona, k=k)
-        retrieved_docs = retriever.invoke(question)
-        print(f"\nRetrieved {len(retrieved_docs)} authorized chunk(s) via Hybrid RRF:")
-        for idx, doc in enumerate(retrieved_docs, start=1):
-            source = Path(doc.metadata.get("source", "Unknown")).name
-            page = doc.metadata.get("page", "N/A")
-            role_tag = doc.metadata.get("persona", "all").upper()
-            print(f"  {idx}. [{role_tag:11}] {source} (Page {page}) - {len(doc.page_content)} chars")
-
     else:
-        retriever = get_advanced_retriever(vector_store, persona=persona, search_type="mmr", k=k)
-        retrieved_docs = retriever.invoke(question)
-        print(f"\nRetrieved {len(retrieved_docs)} authorized chunk(s) via Dense MMR:")
-        for idx, doc in enumerate(retrieved_docs, start=1):
+        print(f"\nRetrieved {len(result['retrieved_docs'])} authorized chunk(s):")
+        for idx, doc in enumerate(result["retrieved_docs"], start=1):
             source = Path(doc.metadata.get("source", "Unknown")).name
             page = doc.metadata.get("page", "N/A")
             role_tag = doc.metadata.get("persona", "all").upper()
             print(f"  {idx}. [{role_tag:11}] {source} (Page {page}) - {len(doc.page_content)} chars")
 
-    # Format the retrieved docs as context
-    context_text = format_documents_with_citations(retrieved_docs)
-
-    chain = build_rag_chain()
     print("\nGenerating grounded response with citations...")
-    answer = chain.invoke({"context": context_text, "question": question})
-
-    print(f"\nANSWER:\n{answer}")
+    print(f"\nANSWER:\n{result['answer']}")
     print("=" * 70 + "\n")
-    return answer
+    return result["answer"]
 
 
 # ==============================================================================
